@@ -1,0 +1,393 @@
+name: Build bluefin-xone
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Containerfile
+      - .github/workflows/build.yml
+  schedule:
+    # Cada 6 horas. GitHub puede retrasarlo unos minutos.
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Forzar rebuild aunque la base y akmods no hayan cambiado"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BASE_REPO: ghcr.io/ublue-os/bluefin-dx-nvidia-open
+  BASE_TAG: stable
+  AKMODS_REPO: ghcr.io/ublue-os/akmods
+  AKMODS_FLAVOR: coreos-stable
+  IMAGE_NAME: bluefin-xone
+
+jobs:
+  build:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+
+      - name: Resolve base, akmods and current state
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          OWNER="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          IMAGE="ghcr.io/${OWNER}/${IMAGE_NAME}"
+          DATE="$(date -u +%Y%m%d)"
+          RECIPE_REVISION="$(sha256sum Containerfile .github/workflows/build.yml | sha256sum | cut -d' ' -f1)"
+
+          BASE_JSON="$(skopeo inspect "docker://${BASE_REPO}:${BASE_TAG}")"
+          BASE_DIGEST="$(jq -r '.Digest // empty' <<<"${BASE_JSON}")"
+          KERNEL="$(jq -r '.Labels["ostree.linux"] // empty' <<<"${BASE_JSON}")"
+          BASE_VERSION="$(jq -r '.Labels["org.opencontainers.image.version"] // "unknown"' <<<"${BASE_JSON}")"
+
+          if [ -z "${BASE_DIGEST}" ] || [ -z "${KERNEL}" ]; then
+            echo "::error::No se pudo leer el digest o el kernel de ${BASE_REPO}:${BASE_TAG}"
+            exit 1
+          fi
+
+          FEDORA_MAJOR="$(sed -E 's/.*\.fc([0-9]+)\..*/\1/' <<<"${KERNEL}")"
+
+          # Preferimos el tag exacto del kernel; si no existe, el genérico del major.
+          AKMODS_TAG="${AKMODS_FLAVOR}-${FEDORA_MAJOR}-${KERNEL}"
+          if ! skopeo inspect "docker://${AKMODS_REPO}:${AKMODS_TAG}" > /tmp/akmods.json 2>/dev/null; then
+            AKMODS_TAG="${AKMODS_FLAVOR}-${FEDORA_MAJOR}"
+            if ! skopeo inspect "docker://${AKMODS_REPO}:${AKMODS_TAG}" > /tmp/akmods.json 2>/dev/null; then
+              {
+                echo "build=false"
+                echo "reason=No hay imagen de akmods ${AKMODS_FLAVOR}-${FEDORA_MAJOR} publicada"
+                echo "owner=${OWNER}"
+                echo "image=${IMAGE}"
+                echo "base_digest=${BASE_DIGEST}"
+                echo "base_version=${BASE_VERSION}"
+                echo "kernel=${KERNEL}"
+                echo "fedora_major=${FEDORA_MAJOR}"
+                echo "akmods_tag=${AKMODS_TAG}"
+                echo "akmods_digest="
+                echo "recipe_revision=${RECIPE_REVISION}"
+                echo "date=${DATE}"
+              } >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+          fi
+
+          AKMODS_KERNEL="$(jq -r '.Labels["ostree.linux"] // empty' /tmp/akmods.json)"
+          AKMODS_DIGEST="$(jq -r '.Digest // empty' /tmp/akmods.json)"
+
+          if [ "${AKMODS_KERNEL}" != "${KERNEL}" ]; then
+            {
+              echo "build=false"
+              echo "reason=akmods ${AKMODS_TAG} es para ${AKMODS_KERNEL}; la base pide ${KERNEL}. Se reintentará en la próxima pasada."
+              echo "owner=${OWNER}"
+              echo "image=${IMAGE}"
+              echo "base_digest=${BASE_DIGEST}"
+              echo "base_version=${BASE_VERSION}"
+              echo "kernel=${KERNEL}"
+              echo "fedora_major=${FEDORA_MAJOR}"
+              echo "akmods_tag=${AKMODS_TAG}"
+              echo "akmods_digest=${AKMODS_DIGEST}"
+              echo "recipe_revision=${RECIPE_REVISION}"
+              echo "date=${DATE}"
+            } >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          PUB_JSON="$(skopeo inspect "docker://${IMAGE}:stable" 2>/dev/null || skopeo inspect --creds "x-access-token:${GH_TOKEN}" "docker://${IMAGE}:stable" 2>/dev/null || true)"
+          if [ -n "${PUB_JSON}" ]; then
+            PUB_BASE="$(jq -r '.Labels["org.bluefin-xone.base-digest"] // empty' <<<"${PUB_JSON}")"
+            PUB_AKMODS="$(jq -r '.Labels["org.bluefin-xone.akmods-digest"] // empty' <<<"${PUB_JSON}")"
+            PUB_RECIPE="$(jq -r '.Labels["org.bluefin-xone.recipe-revision"] // empty' <<<"${PUB_JSON}")"
+
+            if [ "${PUB_BASE}" = "${BASE_DIGEST}" ] && \
+               [ "${PUB_AKMODS}" = "${AKMODS_DIGEST}" ] && \
+               [ "${PUB_RECIPE}" = "${RECIPE_REVISION}" ] && \
+               [ "${FORCE}" != "true" ]; then
+              {
+                echo "build=false"
+                echo "reason=Ya está actualizada: misma base, mismos akmods y misma receta"
+                echo "owner=${OWNER}"
+                echo "image=${IMAGE}"
+                echo "base_digest=${BASE_DIGEST}"
+                echo "base_version=${BASE_VERSION}"
+                echo "kernel=${KERNEL}"
+                echo "fedora_major=${FEDORA_MAJOR}"
+                echo "akmods_tag=${AKMODS_TAG}"
+                echo "akmods_digest=${AKMODS_DIGEST}"
+                echo "recipe_revision=${RECIPE_REVISION}"
+                echo "date=${DATE}"
+              } >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+          fi
+
+          {
+            echo "build=true"
+            echo "reason=Base, akmods o receta han cambiado"
+            echo "owner=${OWNER}"
+            echo "image=${IMAGE}"
+            echo "base_digest=${BASE_DIGEST}"
+            echo "base_version=${BASE_VERSION}"
+            echo "kernel=${KERNEL}"
+            echo "fedora_major=${FEDORA_MAJOR}"
+            echo "akmods_tag=${AKMODS_TAG}"
+            echo "akmods_digest=${AKMODS_DIGEST}"
+            echo "recipe_revision=${RECIPE_REVISION}"
+            echo "date=${DATE}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Summary (no build needed)
+        if: steps.resolve.outputs.build != 'true'
+        env:
+          REASON: ${{ steps.resolve.outputs.reason }}
+          BASE_VERSION: ${{ steps.resolve.outputs.base_version }}
+          KERNEL: ${{ steps.resolve.outputs.kernel }}
+          AKMODS_TAG: ${{ steps.resolve.outputs.akmods_tag }}
+        run: |
+          echo "::notice::${REASON}"
+          {
+            echo "## bluefin-xone"
+            echo ""
+            echo "**No se ha construido nada en esta pasada.**"
+            echo ""
+            echo "- Motivo: ${REASON}"
+            echo "- Bluefin base: \`${BASE_VERSION}\`"
+            echo "- Kernel: \`${KERNEL}\`"
+            echo "- akmods: \`${AKMODS_TAG}\`"
+            echo "- Siguiente intento: en menos de 6 horas (o lanza el workflow a mano)."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Maximize build space
+        if: steps.resolve.outputs.build == 'true'
+        uses: ublue-os/remove-unwanted-software@695eb75bc387dbcd9685a8e72d23439d8686cba6
+
+      - name: Clean Docker and apt
+        if: steps.resolve.outputs.build == 'true'
+        run: |
+          sudo docker system prune -af || true
+          sudo apt-get clean
+          df -h
+
+      - name: Install podman
+        if: steps.resolve.outputs.build == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman buildah
+          sudo podman --version
+          sudo podman info --format '{{.Store.GraphDriverName}}'
+
+      - name: Login to GHCR
+        if: steps.resolve.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s' "${GH_TOKEN}" | sudo podman login ghcr.io -u x-access-token --password-stdin
+          printf '%s' "${GH_TOKEN}" | docker login ghcr.io -u x-access-token --password-stdin
+
+      - name: Build image
+        if: steps.resolve.outputs.build == 'true'
+        id: build
+        env:
+          BASE_IMAGE: ${{ env.BASE_REPO }}@${{ steps.resolve.outputs.base_digest }}
+          AKMODS_IMAGE: ${{ env.AKMODS_REPO }}@${{ steps.resolve.outputs.akmods_digest }}
+          IMAGE: ${{ steps.resolve.outputs.image }}
+          KERNEL: ${{ steps.resolve.outputs.kernel }}
+          BASE_DIGEST: ${{ steps.resolve.outputs.base_digest }}
+          AKMODS_DIGEST: ${{ steps.resolve.outputs.akmods_digest }}
+          RECIPE_REVISION: ${{ steps.resolve.outputs.recipe_revision }}
+          DATE: ${{ steps.resolve.outputs.date }}
+        run: |
+          set -euxo pipefail
+          sudo podman build \
+            --pull=missing \
+            --layers \
+            --format=oci \
+            --network=host \
+            --build-arg BASE_IMAGE="${BASE_IMAGE}" \
+            --build-arg AKMODS_IMAGE="${AKMODS_IMAGE}" \
+            --build-arg KERNEL="${KERNEL}" \
+            --build-arg BASE_DIGEST="${BASE_DIGEST}" \
+            --build-arg AKMODS_DIGEST="${AKMODS_DIGEST}" \
+            --build-arg RECIPE_REVISION="${RECIPE_REVISION}" \
+            -t "${IMAGE}:stable" \
+            -t "${IMAGE}:stable-${DATE}" \
+            -f Containerfile .
+
+      - name: Push image
+        if: steps.resolve.outputs.build == 'true'
+        id: push
+        env:
+          IMAGE: ${{ steps.resolve.outputs.image }}
+          DATE: ${{ steps.resolve.outputs.date }}
+        run: |
+          set -euxo pipefail
+          sudo podman push --format=oci --digestfile=/tmp/image-digest "${IMAGE}:stable"
+          sudo podman push --format=oci "${IMAGE}:stable-${DATE}"
+          DIGEST="$(sudo cat /tmp/image-digest)"
+          SIZE="$(sudo podman image inspect --format '{{.Size}}' "${IMAGE}:stable")"
+          echo "digest=${DIGEST}" >> "${GITHUB_OUTPUT}"
+          echo "size=${SIZE}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install cosign
+        if: steps.resolve.outputs.build == 'true' && steps.push.outputs.digest != ''
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless)
+        if: steps.resolve.outputs.build == 'true' && steps.push.outputs.digest != ''
+        env:
+          IMAGE: ${{ steps.resolve.outputs.image }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euxo pipefail
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Verify signature
+        if: steps.resolve.outputs.build == 'true' && steps.push.outputs.digest != ''
+        env:
+          IMAGE: ${{ steps.resolve.outputs.image }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          IDENTITY="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/build.yml@refs/heads/main"
+          TRIES=0
+          until cosign verify \
+            --certificate-identity "${IDENTITY}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${IMAGE}@${DIGEST}"; do
+            TRIES=$((TRIES + 1))
+            if [ "${TRIES}" -ge 5 ]; then
+              echo "::error::No se pudo verificar la firma de ${IMAGE}@${DIGEST}"
+              exit 1
+            fi
+            sleep 5
+          done
+
+      - name: Update state files
+        if: steps.resolve.outputs.build == 'true' && steps.push.outputs.digest != ''
+        env:
+          IMAGE: ${{ steps.resolve.outputs.image }}
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+          BASE_VERSION: ${{ steps.resolve.outputs.base_version }}
+          BASE_DIGEST: ${{ steps.resolve.outputs.base_digest }}
+          KERNEL: ${{ steps.resolve.outputs.kernel }}
+          AKMODS_TAG: ${{ steps.resolve.outputs.akmods_tag }}
+          AKMODS_DIGEST: ${{ steps.resolve.outputs.akmods_digest }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          KERNEL_SHORT="${KERNEL%%-*}"
+          mkdir -p state
+
+          jq -n \
+            --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg base_image "${BASE_REPO}:${BASE_TAG}" \
+            --arg base_version "${BASE_VERSION}" \
+            --arg base_digest "${BASE_DIGEST}" \
+            --arg kernel "${KERNEL}" \
+            --arg akmods_image "${AKMODS_REPO}:${AKMODS_TAG}" \
+            --arg akmods_digest "${AKMODS_DIGEST}" \
+            --arg image "${IMAGE}:stable" \
+            --arg image_digest "${IMAGE_DIGEST}" \
+            --arg run_url "${RUN_URL}" \
+            '{
+              status: "success",
+              built_at: $built_at,
+              base_image: $base_image,
+              base_version: $base_version,
+              base_digest: $base_digest,
+              kernel: $kernel,
+              akmods_image: $akmods_image,
+              akmods_digest: $akmods_digest,
+              image: $image,
+              image_digest: $image_digest,
+              run_url: $run_url
+            }' > state/last-build.json
+
+          jq -n \
+            --arg message "${BASE_VERSION} · kernel ${KERNEL_SHORT}" \
+            '{schemaVersion: 1, label: "Bluefin", message: $message, color: "blue"}' \
+            > state/badge.json
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state
+          if git diff --cached --quiet; then
+            echo "Sin cambios en state/"
+            exit 0
+          fi
+          git commit -m "chore: update build state (${BASE_VERSION}, kernel ${KERNEL_SHORT})"
+          git push
+
+      - name: Summary (build)
+        if: always()
+        env:
+          BUILD: ${{ steps.resolve.outputs.build }}
+          REASON: ${{ steps.resolve.outputs.reason }}
+          BASE_VERSION: ${{ steps.resolve.outputs.base_version }}
+          BASE_DIGEST: ${{ steps.resolve.outputs.base_digest }}
+          KERNEL: ${{ steps.resolve.outputs.kernel }}
+          FEDORA_MAJOR: ${{ steps.resolve.outputs.fedora_major }}
+          AKMODS_TAG: ${{ steps.resolve.outputs.akmods_tag }}
+          AKMODS_DIGEST: ${{ steps.resolve.outputs.akmods_digest }}
+          IMAGE: ${{ steps.resolve.outputs.image }}
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+          IMAGE_SIZE: ${{ steps.push.outputs.size }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## bluefin-xone"
+            echo ""
+            echo "| Campo | Valor |"
+            echo "|---|---|"
+            echo "| Build | \`${BUILD:-unknown}\` |"
+            echo "| Motivo | ${REASON:-—} |"
+            echo "| Bluefin base | \`${BASE_VERSION:-—}\` |"
+            echo "| Kernel | \`${KERNEL:-—}\` |"
+            echo "| Fedora | \`${FEDORA_MAJOR:-—}\` |"
+            echo "| akmods | \`${AKMODS_TAG:-—}\` |"
+            echo "| Digest base | \`${BASE_DIGEST:-—}\` |"
+            echo "| Digest akmods | \`${AKMODS_DIGEST:-—}\` |"
+            echo "| Imagen | \`${IMAGE:-—}:stable\` |"
+            echo "| Digest imagen | \`${IMAGE_DIGEST:-—}\` |"
+            echo "| Tamaño | ${IMAGE_SIZE:-—} bytes |"
+            echo ""
+            if [ -n "${IMAGE_DIGEST}" ]; then
+              echo "### Verificar la firma"
+              echo ""
+              echo '```bash'
+              echo "cosign verify \\"
+              echo "  --certificate-identity \"https://github.com/${GITHUB_REPOSITORY}/.github/workflows/build.yml@refs/heads/main\" \\"
+              echo "  --certificate-oidc-issuer \"https://token.actions.githubusercontent.com\" \\"
+              echo "  ${IMAGE}@${IMAGE_DIGEST}"
+              echo '```'
+              echo ""
+            fi
+            echo "Run: ${RUN_URL}"
+          } >> "${GITHUB_STEP_SUMMARY}"
