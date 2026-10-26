@@ -1,13 +1,13 @@
 {
   "status": "success",
-  "built_at": "2026-10-25T10:27:29Z",
+  "built_at": "2026-10-26T02:17:13Z",
   "base_image": "ghcr.io/ublue-os/bluefin-dx-nvidia-open:stable",
   "base_version": "44.20261025.1",
   "base_digest": "sha256:3d9e4a37285185868ab5aa18396856a5871262b1d5264ed8485c1e2e8e5e1207",
   "kernel": "7.2.7-200.fc44.x86_64",
   "akmods_image": "ghcr.io/ublue-os/akmods:coreos-stable-44-7.2.7-200.fc44.x86_64",
-  "akmods_digest": "sha256:591cb61295c8d01960f93f20a755386a645b525a00e45268890eb497f7d0240f",
+  "akmods_digest": "sha256:666e2757f2877f02197772101c43e6ce4d611b211bac1dc9a7939e195a6be7ca",
   "image": "ghcr.io/sergigtar/bluefin-xone:stable",
-  "image_digest": "sha256:fba0a993e93f94c3bcf00c7fddd547e8cccca30765e3536657e02d072ff8f733",
-  "run_url": "https://github.com/SergiGTAr/bluefin-xone/actions/runs/40184363943"
+  "image_digest": "sha256:b143b1225eb3b023a698f994de60642db543238fe0d78c4f47d1f656bf3117e4",
+  "run_url": "https://github.com/SergiGTAr/bluefin-xone/actions/runs/40257807841"
 }
